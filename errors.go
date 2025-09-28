@@ -181,27 +181,145 @@ var errorMessages = map[string]string{
 }
 
 // getJSONFieldName returns the JSON field name for a struct field
-func getJSONFieldName(structType reflect.Type, fieldName string) string {
-	for i := 0; i < structType.NumField(); i++ {
-		field := structType.Field(i)
-		if field.Name == fieldName {
-			jsonTag := field.Tag.Get("json")
+func getJSONFieldName(field reflect.StructField) string {
+	jsonTag := field.Tag.Get("json")
+	if jsonTag == "" || jsonTag == "-" {
+		return field.Name
+	}
+	parts := strings.Split(jsonTag, ",")
+	if len(parts) > 0 && parts[0] != "" {
+		return parts[0]
+	}
+	return field.Name
+}
 
-			if jsonTag == "" || jsonTag == "-" {
-				return field.Name
+func formatErrorMessage(err validator.FieldError, jsonFieldName string) string {
+	tag := err.Tag()
+	param := err.Param()
+
+	if messageFormat, exists := errorMessages[tag]; exists {
+		var message string
+		switch tag {
+		case "required", "dir", "file", "image", "isdefault", "unique", "validateFn",
+			"lowercase", "uppercase", "multibyte", "ascii", "printascii",
+			"boolean", "alpha", "alphanum", "alphanumunicode", "alphaunicode",
+			"ip", "ipv4", "ipv6", "email", "url", "uri", "http_url", "uuid",
+			"json", "credit_card", "isbn", "isbn10", "isbn13", "issn", "ssn",
+			"hexadecimal", "hexcolor", "rgb", "rgba", "hsl", "hsla", "iscolor",
+			"country_code", "timezone", "latitude", "longitude",
+			"cidr", "hostname", "fqdn", "mac", "base64", "jwt", "html", "html_encoded",
+			"number", "numeric", "semver", "ulid", "cve", "ein", "btc_addr",
+			"btc_addr_bech32", "eth_addr", "bic", "bcp47_language_tag", "mongodb",
+			"mongodb_connection_string", "cron", "spicedb", "luhn_checksum", "e164":
+			message = fmt.Sprintf(messageFormat, jsonFieldName)
+
+		case "eq", "ne", "gt", "gte", "lt", "lte", "eq_ignore_case", "ne_ignore_case":
+			message = fmt.Sprintf(messageFormat, jsonFieldName, param)
+
+		case "len":
+			message = fmt.Sprintf(messageFormat, jsonFieldName, param)
+
+		case "max", "min":
+			if err.Kind() == reflect.String {
+				message = fmt.Sprintf(errorMessages["len"], jsonFieldName, param)
+			} else {
+				if tag == "min" {
+					message = fmt.Sprintf("the field '%s' must be at least %s", jsonFieldName, param)
+				} else {
+					message = fmt.Sprintf("the field '%s' must be no more than %s", jsonFieldName, param)
+				}
 			}
 
-			// Parse the json tag to extract the field name
-			parts := strings.Split(jsonTag, ",")
-			if len(parts) > 0 && parts[0] != "" {
-				return parts[0]
-			}
+		case "oneof":
+			message = fmt.Sprintf(messageFormat, jsonFieldName, param)
 
-			return field.Name
+		case "eqfield", "nefield", "gtfield", "gtefield", "ltfield", "ltefield",
+			"eqcsfield", "necsfield", "gtcsfield", "gtecsfield", "ltcsfield", "ltecsfield":
+			message = fmt.Sprintf(messageFormat, jsonFieldName, param)
+
+		case "contains", "containsany", "containsrune", "excludes", "excludesall",
+			"excludesrune", "endswith", "endsnotwith", "startswith", "startsnotwith":
+			message = fmt.Sprintf(messageFormat, jsonFieldName, param)
+
+		case "required_if", "required_unless", "required_with", "required_with_all",
+			"required_without", "required_without_all", "excluded_if", "excluded_unless",
+			"excluded_with", "excluded_with_all", "excluded_without", "excluded_without_all":
+			message = fmt.Sprintf(messageFormat, jsonFieldName, param)
+
+		case "postcode_iso3166_alpha2", "postcode_iso3166_alpha2_field":
+			message = fmt.Sprintf(messageFormat, jsonFieldName, param)
+
+		case "datetime":
+			message = fmt.Sprintf(messageFormat, jsonFieldName, param)
+
+		default:
+			message = fmt.Sprintf(messageFormat, jsonFieldName)
+		}
+		return message
+	}
+	return err.Error()
+}
+
+func deepValidator(s interface{}, validate *validator.Validate) map[string]string {
+	errors := make(map[string]string)
+	val := reflect.ValueOf(s)
+	typ := reflect.TypeOf(s)
+
+	if typ.Kind() == reflect.Ptr {
+		if val.IsNil() {
+			return nil
+		}
+		val = val.Elem()
+		typ = typ.Elem()
+	}
+
+	// Validate the struct itself
+	var errs validator.ValidationErrors
+	err := validate.Struct(s)
+	if err != nil {
+		errs = err.(validator.ValidationErrors)
+		for _, e := range errs {
+			fieldName := e.StructField()
+			if f, ok := typ.FieldByName(fieldName); ok {
+				errors[getJSONFieldName(f)] = formatErrorMessage(e, getJSONFieldName(f))
+			}
 		}
 	}
 
-	return fieldName
+	// Process struct fields recursively
+	for i := 0; i < val.NumField(); i++ {
+		field := val.Field(i)
+		fieldType := typ.Field(i)
+		jsonFieldName := getJSONFieldName(fieldType)
+
+		switch field.Kind() {
+		case reflect.Struct:
+			nestedErrors := deepValidator(field.Interface(), validate)
+			for k, v := range nestedErrors {
+				errors[fmt.Sprintf("%s.%s", jsonFieldName, k)] = v
+			}
+		case reflect.Ptr:
+			if !field.IsNil() && field.Elem().Kind() == reflect.Struct {
+				nestedErrors := deepValidator(field.Interface(), validate)
+				for k, v := range nestedErrors {
+					errors[fmt.Sprintf("%s.%s", jsonFieldName, k)] = v
+				}
+			}
+		case reflect.Slice, reflect.Array:
+			// Only process if the slice/array contains structs
+			if field.Type().Elem().Kind() == reflect.Struct {
+				for j := 0; j < field.Len(); j++ {
+					elem := field.Index(j)
+					nestedErrors := deepValidator(elem.Interface(), validate)
+					for k, v := range nestedErrors {
+						errors[fmt.Sprintf("%s[%d].%s", jsonFieldName, j, k)] = v
+					}
+				}
+			}
+		}
+	}
+
+	return errors
 }
 
 // ValidateStruct validates a struct and returns JSON field names in error messages
@@ -209,262 +327,13 @@ func ValidateStruct(s interface{}) map[string]string {
 	if s == nil {
 		return nil
 	}
-
 	validate := validator.New()
-	err := validate.Struct(s)
-	if err == nil {
-		return nil
-	}
-
-	// Check if err is of type validator.ValidationErrors
-	if _, ok := err.(validator.ValidationErrors); !ok {
-		return nil
-	}
-
-	errors := make(map[string]string)
-
-	for _, err := range err.(validator.ValidationErrors) {
-		fieldName := err.StructField() // Use StructField() to get the Go field name
-		jsonFieldName := fieldName     // Default to field name
-		tag := err.Tag()
-		param := err.Param()
-
-		// Try to get JSON field name
-		if v := reflect.ValueOf(s); v.Kind() == reflect.Ptr {
-			if !v.IsNil() && v.Elem().Kind() == reflect.Struct {
-				jsonFieldName = getJSONFieldName(v.Elem().Type(), fieldName)
-			}
-		} else if v.Kind() == reflect.Struct {
-			jsonFieldName = getJSONFieldName(v.Type(), fieldName)
-		}
-
-		if messageFormat, exists := errorMessages[tag]; exists {
-			var message string
-			switch tag {
-			case "required", "dir", "file", "image", "isdefault", "unique", "validateFn",
-				"lowercase", "uppercase", "multibyte", "ascii", "printascii",
-				"boolean", "alpha", "alphanum", "alphanumunicode", "alphaunicode",
-				"ip", "ipv4", "ipv6", "email", "url", "uri", "http_url", "uuid",
-				"json", "credit_card", "isbn", "isbn10", "isbn13", "issn", "ssn",
-				"hexadecimal", "hexcolor", "rgb", "rgba", "hsl", "hsla", "iscolor",
-				"country_code", "timezone", "latitude", "longitude",
-				"cidr", "hostname", "fqdn", "mac", "base64", "jwt", "html", "html_encoded",
-				"number", "numeric", "semver", "ulid", "cve", "ein", "btc_addr",
-				"btc_addr_bech32", "eth_addr", "bic", "bcp47_language_tag", "mongodb",
-				"mongodb_connection_string", "cron", "spicedb", "luhn_checksum", "e164":
-				message = fmt.Sprintf(messageFormat, jsonFieldName)
-
-			case "eq", "ne", "gt", "gte", "lt", "lte", "eq_ignore_case", "ne_ignore_case":
-				message = fmt.Sprintf(messageFormat, jsonFieldName, param)
-
-			case "len":
-				message = fmt.Sprintf(messageFormat, jsonFieldName, param)
-
-			case "max", "min":
-				// For numeric values, use a different message
-				if err.Kind() == reflect.String {
-					// If it's a string field, use the length message
-					message = fmt.Sprintf(errorMessages["len"], jsonFieldName, param)
-				} else {
-					// For numeric fields, use "at least" or "no more than" message
-					if tag == "min" {
-						message = fmt.Sprintf("the field '%s' must be at least %s", jsonFieldName, param)
-					} else { // max
-						message = fmt.Sprintf("the field '%s' must be no more than %s", jsonFieldName, param)
-					}
-				}
-
-			case "oneof":
-				message = fmt.Sprintf(messageFormat, jsonFieldName, param)
-
-			case "eqfield", "nefield", "gtfield", "gtefield", "ltfield", "ltefield",
-				"eqcsfield", "necsfield", "gtcsfield", "gtecsfield", "ltcsfield", "ltecsfield":
-				message = fmt.Sprintf(messageFormat, jsonFieldName, param)
-
-			case "contains", "containsany", "containsrune", "excludes", "excludesall",
-				"excludesrune", "endswith", "endsnotwith", "startswith", "startsnotwith":
-				message = fmt.Sprintf(messageFormat, jsonFieldName, param)
-
-			case "required_if", "required_unless", "required_with", "required_with_all",
-				"required_without", "required_without_all", "excluded_if", "excluded_unless",
-				"excluded_with", "excluded_with_all", "excluded_without", "excluded_without_all":
-				message = fmt.Sprintf(messageFormat, jsonFieldName, param)
-
-			case "postcode_iso3166_alpha2", "postcode_iso3166_alpha2_field":
-				message = fmt.Sprintf(messageFormat, jsonFieldName, param)
-
-			case "datetime":
-				message = fmt.Sprintf(messageFormat, jsonFieldName, param)
-
-			default:
-				message = fmt.Sprintf(messageFormat, jsonFieldName)
-			}
-
-			errors[jsonFieldName] = message
-		} else {
-			errors[jsonFieldName] = err.Error()
-		}
-	}
-
-	return errors
-}
-
-// validateRecursive validates nested structures recursively using JSON field names
-func validateRecursive(v reflect.Value, validate *validator.Validate, prefix string) map[string]string {
-	errors := make(map[string]string)
-
-	switch v.Kind() {
-	case reflect.Struct:
-		// Validate the struct itself
-		structInterface := v.Interface()
-		err := validate.Struct(structInterface)
-		if err != nil {
-			for _, validationErr := range err.(validator.ValidationErrors) {
-				fieldName := validationErr.StructField() // Use StructField() to get the Go field name
-				jsonFieldName := fieldName
-				tag := validationErr.Tag()
-				param := validationErr.Param()
-
-				// Get JSON field name
-				structType := v.Type()
-				jsonFieldName = getJSONFieldName(structType, fieldName)
-
-				fullFieldName := jsonFieldName
-				if prefix != "" {
-					fullFieldName = fmt.Sprintf("%s.%s", prefix, jsonFieldName)
-				}
-
-				if messageFormat, exists := errorMessages[tag]; exists {
-					var message string
-					switch tag {
-					case "required", "dir", "file", "image", "isdefault", "unique", "validateFn",
-						"lowercase", "uppercase", "multibyte", "ascii", "printascii",
-						"boolean", "alpha", "alphanum", "alphanumunicode", "alphaunicode",
-						"ip", "ipv4", "ipv6", "email", "url", "uri", "http_url", "uuid",
-						"json", "credit_card", "isbn", "isbn10", "isbn13", "issn", "ssn",
-						"hexadecimal", "hexcolor", "rgb", "rgba", "hsl", "hsla", "iscolor",
-						"country_code", "timezone", "latitude", "longitude",
-						"cidr", "hostname", "fqdn", "mac", "base64", "jwt", "html", "html_encoded",
-						"number", "numeric", "semver", "ulid", "cve", "ein", "btc_addr",
-						"btc_addr_bech32", "eth_addr", "bic", "bcp47_language_tag", "mongodb",
-						"mongodb_connection_string", "cron", "spicedb", "luhn_checksum", "e164":
-						message = fmt.Sprintf(messageFormat, fullFieldName)
-
-					case "eq", "ne", "gt", "gte", "lt", "lte", "eq_ignore_case", "ne_ignore_case":
-						message = fmt.Sprintf(messageFormat, fullFieldName, param)
-
-					case "len":
-						message = fmt.Sprintf(messageFormat, fullFieldName, param)
-
-					case "max", "min":
-						// For numeric values, use a different message
-						if validationErr.Kind() == reflect.String {
-							// If it's a string field, use the length message
-							message = fmt.Sprintf(errorMessages["len"], fullFieldName, param)
-						} else {
-							// For numeric fields, use "at least" or "no more than" message
-							if tag == "min" {
-								message = fmt.Sprintf("the field '%s' must be at least %s", fullFieldName, param)
-							} else { // max
-								message = fmt.Sprintf("the field '%s' must be no more than %s", fullFieldName, param)
-							}
-						}
-
-					case "oneof":
-						message = fmt.Sprintf(messageFormat, fullFieldName, param)
-
-					case "eqfield", "nefield", "gtfield", "gtefield", "ltfield", "ltefield",
-						"eqcsfield", "necsfield", "gtcsfield", "gtecsfield", "ltcsfield", "ltecsfield":
-						message = fmt.Sprintf(messageFormat, fullFieldName, param)
-
-					case "contains", "containsany", "containsrune", "excludes", "excludesall",
-						"excludesrune", "endswith", "endsnotwith", "startswith", "startsnotwith":
-						message = fmt.Sprintf(messageFormat, fullFieldName, param)
-
-					case "required_if", "required_unless", "required_with", "required_with_all",
-						"required_without", "required_without_all", "excluded_if", "excluded_unless",
-						"excluded_with", "excluded_with_all", "excluded_without", "excluded_without_all":
-						message = fmt.Sprintf(messageFormat, fullFieldName, param)
-
-					case "postcode_iso3166_alpha2", "postcode_iso3166_alpha2_field":
-						message = fmt.Sprintf(messageFormat, fullFieldName, param)
-
-					case "datetime":
-						message = fmt.Sprintf(messageFormat, fullFieldName, param)
-
-					default:
-						message = fmt.Sprintf(messageFormat, fullFieldName)
-					}
-
-					errors[fullFieldName] = message
-				} else {
-					errors[fullFieldName] = validationErr.Error()
-				}
-			}
-		}
-
-		// Recursively validate nested structs and slices
-		for i := 0; i < v.NumField(); i++ {
-			field := v.Field(i)
-			fieldType := v.Type().Field(i)
-
-			// Skip unexported fields
-			if !field.CanInterface() {
-				continue
-			}
-
-			jsonFieldName := getJSONFieldName(v.Type(), fieldType.Name)
-			fieldName := jsonFieldName
-			if prefix != "" {
-				fieldName = fmt.Sprintf("%s.%s", prefix, jsonFieldName)
-			}
-
-			// Only validate if the field is a struct, slice, or array
-			if field.Kind() == reflect.Struct || field.Kind() == reflect.Slice || field.Kind() == reflect.Array || field.Kind() == reflect.Ptr {
-				nestedErrors := validateRecursive(field, validate, fieldName)
-				for k, v := range nestedErrors {
-					errors[k] = v
-				}
-			}
-		}
-
-	case reflect.Slice, reflect.Array:
-		for i := 0; i < v.Len(); i++ {
-			element := v.Index(i)
-			elementPrefix := fmt.Sprintf("%s[%d]", prefix, i)
-			nestedErrors := validateRecursive(element, validate, elementPrefix)
-			for k, v := range nestedErrors {
-				errors[k] = v
-			}
-		}
-
-	case reflect.Ptr:
-		if !v.IsNil() {
-			return validateRecursive(v.Elem(), validate, prefix)
-		}
-	}
-
-	return errors
+	return deepValidator(s, validate)
 }
 
 // ValidateStructDeep validates a struct with deep nested validation using JSON field names
 func ValidateStructDeep(s interface{}) map[string]string {
-	if s == nil {
-		return nil
-	}
-
-	validate := validator.New()
-	v := reflect.ValueOf(s)
-
-	// Handle pointer to struct
-	if v.Kind() == reflect.Ptr {
-		if v.IsNil() {
-			return nil
-		}
-		v = v.Elem()
-	}
-
-	return validateRecursive(v, validate, "")
+	return ValidateStruct(s)
 }
 
 // ValidateSliceDeep validates a slice/array with deep nested validation using JSON field names
@@ -472,52 +341,54 @@ func ValidateSliceDeep(slice interface{}) map[string]string {
 	if slice == nil {
 		return nil
 	}
-
 	validate := validator.New()
-	v := reflect.ValueOf(slice)
-
-	if v.Kind() != reflect.Slice && v.Kind() != reflect.Array {
-		return map[string]string{
-			"root": "provided value is neither a struct nor a slice/array",
-		}
-	}
-
 	errors := make(map[string]string)
+	val := reflect.ValueOf(slice)
 
-	for i := 0; i < v.Len(); i++ {
-		element := v.Index(i)
-		elementPrefix := fmt.Sprintf("[%d]", i)
-		nestedErrors := validateRecursive(element, validate, elementPrefix)
-		for k, v := range nestedErrors {
-			errors[k] = v
-		}
+	if val.Kind() != reflect.Slice && val.Kind() != reflect.Array {
+		return map[string]string{"root": "provided value is neither a struct nor a slice/array"}
 	}
 
+	// Only process slices/arrays that contain structs
+	elemType := val.Type().Elem()
+	if elemType.Kind() != reflect.Struct && 
+	   (elemType.Kind() == reflect.Ptr && elemType.Elem().Kind() != reflect.Struct) {
+		return nil // Don't validate slices of non-struct types
+	}
+
+	for i := 0; i < val.Len(); i++ {
+		elem := val.Index(i)
+		if elem.Kind() == reflect.Struct || 
+		   (elem.Kind() == reflect.Ptr && !elem.IsNil() && elem.Elem().Kind() == reflect.Struct) {
+			nestedErrors := deepValidator(elem.Interface(), validate)
+			for k, v := range nestedErrors {
+				errors[fmt.Sprintf("[%d].%s", i, k)] = v
+			}
+		}
+	}
 	return errors
 }
 
 // ValidateAny validates any input (struct, slice, or array) with deep nesting using JSON field names
 func ValidateAny(input interface{}) map[string]string {
+	if input == nil {
+		return nil
+	}
 	v := reflect.ValueOf(input)
 
-	switch v.Kind() {
-	case reflect.Slice, reflect.Array:
-		return ValidateSliceDeep(input)
-	case reflect.Struct:
-		return ValidateStructDeep(input)
-	case reflect.Ptr:
+	if v.Kind() == reflect.Ptr {
 		if v.IsNil() {
 			return nil
 		}
-		if v.Elem().Kind() == reflect.Struct {
-			return ValidateStructDeep(input)
-		} else if v.Elem().Kind() == reflect.Slice || v.Elem().Kind() == reflect.Array {
-			return ValidateSliceDeep(input)
-		}
-		fallthrough
+		v = v.Elem()
+	}
+
+	switch v.Kind() {
+	case reflect.Struct:
+		return ValidateStructDeep(input)
+	case reflect.Slice, reflect.Array:
+		return ValidateSliceDeep(input)
 	default:
-		return map[string]string{
-			"root": "provided value is neither a struct nor a slice/array",
-		}
+		return map[string]string{"root": "provided value is neither a struct nor a slice/array"}
 	}
 }
