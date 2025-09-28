@@ -10,31 +10,30 @@ Here are some examples of how to use the Friendly Errors library in your Go proj
 package main
 
 import (
-    "fmt"
-    "github.com/go-playground/validator/v10"
-    "path/to/friendly-errors"
+	"fmt"
+
+	friendlyerrors "github.com/ProImpact/friendly-errors"
 )
 
 // User struct which has validation tags
 type User struct {
-    Email    string `validate:"required,email"`
-    Password string `validate:"required,min=8"`
+	Email    string `validate:"required,email" json:"email,omitempty"`
+	Password string `validate:"required,min=8" json:"password,omitempty"`
 }
 
 func main() {
-    validate := validator.New()
-    user := &User{
-        Email:    "invalid-email",
-        Password: "short",
-    }
+	user := &User{
+		Email:    "invalid-email",
+		Password: "short",
+	}
 
-    // Validate the struct
-    err := validate.Struct(user)
-    if err != nil {
-        // Use Friendly Errors to output readable error messages
-        friendlyErrs := friendly_errors.ParseValidationError(err)
-        fmt.Println(friendlyErrs)
-    }
+	// Validate the struct
+	err := friendlyerrors.ValidateAny(user)
+	if len(err) > 0 {
+		for k, v := range err {
+			fmt.Printf("Error: field -> %s, message -> %s\n", k, v)
+		}
+	}
 }
 ```
 
